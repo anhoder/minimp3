@@ -69,6 +69,30 @@ func NewDecoder(reader io.Reader) (dec *Decoder, err error) {
 				return
 			default:
 			}
+			if len(dec.data) > BufferSize {
+				<-time.After(WaitForDataDuration)
+				continue
+			}
+			var data = make([]byte, 512)
+			var n int
+			n, err = reader.Read(data)
+			dec.err = err
+
+			dec.readerLocker.Lock()
+			dec.data = append(dec.data, data[:n]...)
+			dec.readerLocker.Unlock()
+			if err != nil && err != io.ErrUnexpectedEOF {
+				break
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-dec.context.Done():
+				return
+			default:
+			}
 			if len(dec.decodedData) > BufferSize {
 				<-time.After(WaitForDataDuration)
 				continue
@@ -76,21 +100,9 @@ func NewDecoder(reader io.Reader) (dec *Decoder, err error) {
 			var decoded = [maxSamplesPerFrame * 2]byte{}
 			var decodedLength = C.int(0)
 			var length = C.int(len(dec.data))
-			for len(dec.data) < maxSamplesPerFrame*2 {
-				var data = make([]byte, 512)
-				var n int
-				n, err = io.ReadFull(reader, data)
-				dec.err = err
-
-				dec.readerLocker.Lock()
-				dec.data = append(dec.data, data[:n]...)
-				dec.readerLocker.Unlock()
-				if err != nil {
-					break
-				}
-			}
-			if err != nil && err != io.ErrUnexpectedEOF {
-				break
+			if len(dec.data) == 0 {
+				<-time.After(WaitForDataDuration)
+				continue
 			}
 			frameSize := C.decode(&dec.decode, &dec.info,
 				(*C.uchar)(unsafe.Pointer(&dec.data[0])),
@@ -141,15 +153,20 @@ func (dec *Decoder) Started() (channel chan bool) {
 
 // Read read the raw stream
 func (dec *Decoder) Read(data []byte) (n int, err error) {
-	dec.decoderLocker.Lock()
-	defer dec.decoderLocker.Unlock()
 	for len(dec.decodedData) == 0 {
+		select {
+		case <-dec.context.Done():
+			return 0, io.EOF
+		default:
+		}
 		if dec.err == io.EOF {
 			err = io.EOF
 			return
 		}
 		<-time.After(WaitForDataDuration)
 	}
+	dec.decoderLocker.Lock()
+	defer dec.decoderLocker.Unlock()
 	n = copy(data, dec.decodedData[:])
 	dec.decodedData = dec.decodedData[n:]
 	return
